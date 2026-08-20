@@ -1,0 +1,52 @@
+# 忽略 Demo 的普通构建输出目录。
+demo/build/
+
+# 忽略 CMake 独立构建输出目录。
+demo/build-cmake/
+
+# 忽略通用构建和打包临时目录。
+build/
+out/
+tmp/
+
+# 忽略 C/C++ 编译产生的目标文件和依赖文件。
+*.o
+*.obj
+*.d
+
+# 忽略静态库、临时库和链接器中间文件。
+*.a
+*.la
+
+# 忽略编译器和脚本产生的临时文件。
+*.tmp
+*.swp
+*.swo
+
+# 忽略运行日志和崩溃转储文件。
+*.log
+*.core
+core
+
+# 忽略本地 IDE 配置目录。
+.vscode/
+.idea/
+
+# 忽略操作系统生成的目录和文件。
+.DS_Store
+Thumbs.db
+
+# 忽略包含真实设备凭据的 Demo 配置文件。
+demo/config/workcard-demo.conf
+
+# 忽略包含真实 SDK 运行凭据的配置文件。
+runtime/config/workcard-sdk.conf
+
+# 忽略包含真实 WiFi 密码的联网配置文件。
+runtime/connectivity/wifi.conf
+
+# 忽略本地工具链安装环境文件。
+toolchain/.env
+
+# 忽略清单生成过程中的临时文件。
+MANIFEST.sha256.tmp
