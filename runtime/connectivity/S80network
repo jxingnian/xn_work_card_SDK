@@ -1,0 +1,63 @@
+#!/bin/sh
+
+# 这是正式固件的网络初始化脚本，只配置厂家固定的 eth0 调试地址。
+ipaddr=192.168.1.168
+bootp=
+gateway=192.168.1.1
+netmask=255.255.255.0
+hostname=localhost
+netdev=eth0
+autoconf=off
+
+# 解析内核命令行中的网络覆盖参数，保持厂家固定地址兼容性。
+for ipinfo in $(cat /proc/cmdline); do
+    case "$ipinfo" in
+        ip=*)
+            for var in ipaddr bootp gateway netmask hostname netdev autoconf; do
+                eval read "$var"
+            done <<EOF
+$(echo "$ipinfo" | sed 's/:/\n/g' | sed 's/^[ \t]*$/-/g')
+EOF
+            ipaddr=$(echo "$ipaddr" | cut -d = -f 2)
+            [ -z "$ipaddr" ] && ipaddr=x
+            ;;
+    esac
+done
+
+# 没有网络参数时不修改系统网络状态。
+[ -z "$ipaddr" ] && exit 0
+
+# 使用系统主机名配置覆盖默认主机名。
+if [ -s /etc/hostname ]; then
+    hostname=$(cat /etc/hostname)
+fi
+
+# 输出网络初始化摘要，便于串口验收。
+echo "      IP: $ipaddr"
+echo "   BOOTP: $bootp"
+echo " GATEWAY: $gateway"
+echo " NETMASK: $netmask"
+echo "HOSTNAME: $hostname"
+echo "  NETDEV: $netdev"
+echo "AUTOCONF: $autoconf"
+
+# 按厂家参数配置静态地址或 DHCP。
+if [ "x$ipaddr" = x- ] || [ "x$autoconf" = xon ]; then
+    udhcpc -i "$netdev"
+else
+    ifconfig "$netdev" "$ipaddr"
+    [ "x$netmask" != x- ] && ifconfig "$netdev" netmask "$netmask"
+    [ "x$gateway" != x- ] && route add default gw "$gateway"
+fi
+
+# 设置主机名并确保回环接口可用。
+[ -n "$hostname" ] && echo "$hostname" > /proc/sys/kernel/hostname
+ifconfig lo 127.0.0.1
+
+# 在 SSH 和业务服务启动前启用内核 Panic 五秒自动重启保护。
+if [ -w /proc/sys/kernel/panic ]; then
+    echo 5 > /proc/sys/kernel/panic
+fi
+
+# 正式固件只提供 SSH，禁止启动明文 Telnet 服务。
+exit 0

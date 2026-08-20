@@ -1,0 +1,8 @@
+# 当前固定固件的产品型号。
+device_model=HongOu Lite_P
+
+# 当前固定固件的硬件版本。
+hardware_revision=Hi3516CV610-20S+SC2356+WS73
+
+# SDK 服务 Socket 路径由固定固件管理，客户应用无需修改。
+service_socket=/run/workcard-sdk/service.sock

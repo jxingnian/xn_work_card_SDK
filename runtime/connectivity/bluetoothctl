@@ -1,0 +1,22 @@
+#!/bin/sh
+
+# 定义 BlueZ 命令行工具的私有安装路径。
+BLUETOOTHCTL_BIN="/opt/bluealsa/bin/bluetoothctl.bin"
+
+# 校验真实程序是否存在并且具有执行权限。
+if [ ! -x "$BLUETOOTHCTL_BIN" ]; then
+    # 向标准错误输出明确的安装异常。
+    echo "bluetoothctl: 找不到可执行文件 $BLUETOOTHCTL_BIN" >&2
+
+    # 返回命令不存在的标准退出码。
+    exit 127
+fi
+
+# 仅为当前蓝牙命令设置私有动态库路径，避免污染其他系统程序。
+export LD_LIBRARY_PATH="/opt/bluealsa/lib:/usr/lib:/lib"
+
+# 固定连接 SDK 管理的系统总线，避免读取 rootfs 中已失效的厂商构建路径。
+export DBUS_SYSTEM_BUS_ADDRESS="unix:path=/run/dbus/system_bus_socket"
+
+# 使用真实程序替换包装器进程，并原样传递全部命令行参数。
+exec "$BLUETOOTHCTL_BIN" "$@"

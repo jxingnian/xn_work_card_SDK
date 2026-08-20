@@ -1,0 +1,75 @@
+#!/bin/sh
+
+# 本服务固定在经典蓝牙之前启动，确保 WS73U WiFi 优先完成初始化。
+
+# 定义独立于客户业务和旧媒体程序的系统联网目录。
+APP_DIR="/opt/workcard-connectivity"
+
+# 定义 WS73 联网守护脚本。
+WIFI_WORKER="$APP_DIR/ws73-wifi-worker"
+
+# 定义包含敏感无线凭据的配置文件。
+WIFI_CONFIG="$APP_DIR/wifi.conf"
+
+# 定义联网守护 PID 文件。
+WIFI_PID_FILE="/run/xingnian-wifi.pid"
+
+# 定义 Wi-Fi 运行日志。
+WIFI_LOG_FILE="/tmp/xingnian-wifi.log"
+
+# 停止本服务创建的联网守护进程。
+stop_wifi()
+{
+    # PID 文件不存在时无需停止。
+    if [ ! -f "$WIFI_PID_FILE" ]; then
+        return 0
+    fi
+
+    # 读取守护进程编号。
+    WIFI_PID="$(cat "$WIFI_PID_FILE" 2>/dev/null)"
+
+    # 正常结束仍在运行的守护进程。
+    if [ -n "$WIFI_PID" ] && kill -0 "$WIFI_PID" 2>/dev/null; then
+        kill "$WIFI_PID"
+    fi
+
+    # 删除失效 PID 文件。
+    rm -f "$WIFI_PID_FILE"
+}
+
+# 启动 WS73 联网守护并立即返回系统开机流程。
+start_wifi()
+{
+    # 校验脚本和敏感配置已经完整安装。
+    if [ ! -x "$WIFI_WORKER" ] || [ ! -r "$WIFI_CONFIG" ]; then
+        echo "ERROR: WS73 Wi-Fi files are not completely installed"
+        return 1
+    fi
+
+    # 避免重复运行多个联网守护。
+    stop_wifi
+
+    # 后台运行 Wi-Fi 连接和断线恢复逻辑。
+    "$WIFI_WORKER" "$WIFI_CONFIG" >>"$WIFI_LOG_FILE" 2>&1 &
+
+    # 记录联网守护进程编号。
+    echo "$!" >"$WIFI_PID_FILE"
+}
+
+# 根据开机服务参数执行对应操作。
+case "${1:-start}" in
+    start)
+        start_wifi
+        ;;
+    stop)
+        stop_wifi
+        ;;
+    restart)
+        stop_wifi
+        start_wifi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,70 @@
+#!/bin/sh
+
+# 定义出厂板载以太网接口。
+ETH_INTERFACE="eth0"
+
+# 定义有线 DHCP 客户端 PID 文件。
+DHCP_PID_FILE="/run/xingnian-eth0-udhcpc.pid"
+
+# 定义有线 DHCP 运行日志文件。
+DHCP_LOG_FILE="/tmp/xingnian-eth0-dhcp.log"
+
+# 定义只配置局域网地址且禁止默认路由的 DHCP 事件脚本。
+DHCP_EVENT_SCRIPT="/opt/workcard-connectivity/udhcpc-eth0-local-only"
+
+# 停止本服务创建的有线 DHCP 客户端。
+stop_dhcp()
+{
+    # PID 文件不存在时无需停止。
+    if [ ! -f "$DHCP_PID_FILE" ]; then
+        return 0
+    fi
+
+    # 读取 DHCP 客户端进程编号。
+    DHCP_PID="$(cat "$DHCP_PID_FILE" 2>/dev/null)"
+
+    # 进程仍存在时发送正常退出信号。
+    if [ -n "$DHCP_PID" ] && kill -0 "$DHCP_PID" 2>/dev/null; then
+        kill "$DHCP_PID"
+    fi
+
+    # 删除已经失效的 PID 文件。
+    rm -f "$DHCP_PID_FILE"
+}
+
+# 启动有线 DHCP 并在取得租约后转入后台续租。
+start_dhcp()
+{
+    # 缺少受控事件脚本时拒绝启动可能写入默认路由的 DHCP 客户端。
+    if [ ! -x "$DHCP_EVENT_SCRIPT" ]; then
+        echo "ERROR: eth0 local-only DHCP event script is missing"
+        return 1
+    fi
+
+    # 确保板载以太网接口处于启用状态。
+    ifconfig "$ETH_INTERFACE" 0.0.0.0 up || return 1
+
+    # 避免重复运行本服务的 DHCP 客户端。
+    stop_dhcp
+
+    # 只获取局域网调试地址，并由自有事件脚本拒绝默认路由和 DNS。
+    udhcpc -b -i "$ETH_INTERFACE" -p "$DHCP_PID_FILE" -s "$DHCP_EVENT_SCRIPT" >"$DHCP_LOG_FILE" 2>&1
+}
+
+# 根据开机服务参数执行对应操作。
+case "${1:-start}" in
+    start)
+        start_dhcp
+        ;;
+    stop)
+        stop_dhcp
+        ;;
+    restart)
+        stop_dhcp
+        start_dhcp
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,377 @@
+#!/bin/sh
+
+# 本服务在 WiFi 初始化后启动独立的必联 RTL8723DS UART 经典蓝牙。
+
+# 定义必联 RTL8723DS 蓝牙服务的固定配置文件。
+BLUETOOTH_CONFIG="/etc/bluetooth/rtl8723ds.conf"
+
+# 定义与固定 Linux 5.10.221 内核匹配的 Realtek HCI UART 模块。
+HCI_UART_MODULE="/lib/modules/5.10.221/extra/hci_uart.ko"
+
+# 定义负责下载 Realtek 固件并绑定 H5 线路规程的工具。
+HCI_ATTACH_BIN="/usr/sbin/rtk_hciattach"
+
+# 定义 RTL8723DS 蓝牙固件目录。
+RTL_FIRMWARE_DIR="/lib/firmware/rtlbt"
+
+# 定义 RTL8723DS 蓝牙固件文件。
+RTL_FIRMWARE_FILE="$RTL_FIRMWARE_DIR/rtl8723d_fw"
+
+# 定义 RTL8723DS 板级参数文件。
+RTL_CONFIG_FILE="$RTL_FIRMWARE_DIR/rtl8723d_config"
+
+# 定义正式 D-Bus 守护进程。
+DBUS_DAEMON_BIN="/usr/bin/dbus-daemon"
+
+# 定义不包含厂家构建机绝对路径的系统总线配置。
+DBUS_CONFIG="/opt/workcard-connectivity/dbus-system.conf"
+
+# 定义正式 BlueZ 守护进程。
+BLUETOOTH_DAEMON_BIN="/usr/libexec/bluetooth/bluetoothd"
+
+# 定义正式 BlueALSA 守护进程。
+BLUEALSA_DAEMON_BIN="/opt/bluealsa/bin/bluealsad"
+
+# 定义已经绑定私有运行库和系统总线地址的 BlueZ 控制命令。
+BLUETOOTHCTL_BIN="/usr/bin/bluetoothctl"
+
+# 定义长期驻留的 HCI UART 绑定进程号文件。
+HCI_ATTACH_PID_FILE="/run/rtk_hciattach.pid"
+
+# 定义 BlueZ 进程号文件。
+BLUETOOTH_DAEMON_PID_FILE="/run/bluetoothd.pid"
+
+# 定义 BlueALSA 进程号文件。
+BLUEALSA_DAEMON_PID_FILE="/run/bluealsad.pid"
+
+# 定义蓝牙初始化日志。
+BLUETOOTH_LOG_FILE="/tmp/bluetooth-audio.log"
+
+# 固定私有蓝牙运行库搜索路径，避免污染其他业务进程。
+export LD_LIBRARY_PATH="/opt/bluealsa/lib:/usr/lib:/lib"
+
+# 固定 ALSA 主配置目录。
+export ALSA_CONFIG_DIR="/opt/bluealsa/share/alsa"
+
+# 固定 ALSA 主配置文件。
+export ALSA_CONFIG_PATH="/opt/bluealsa/share/alsa/alsa.conf"
+
+# 固定 ALSA 动态插件目录。
+export ALSA_PLUGIN_DIR="/opt/bluealsa/lib/alsa-lib"
+
+# 固定 BlueZ 和 BlueALSA 共用的系统 D-Bus 地址。
+export DBUS_SYSTEM_BUS_ADDRESS="unix:path=/run/dbus/system_bus_socket"
+
+# 判断进程号文件对应的进程是否仍在运行。
+is_pid_running()
+{
+    # 进程号文件不可读时返回未运行。
+    [ -r "$1" ] || return 1
+
+    # 读取进程号并忽略损坏内容。
+    SERVICE_PID="$(cat "$1" 2>/dev/null)"
+
+    # 使用零信号检查目标进程是否存在。
+    [ -n "$SERVICE_PID" ] && kill -0 "$SERVICE_PID" 2>/dev/null
+}
+
+# 检查唯一正式控制器是否由 hci_uart 线路规程注册。
+controller_ready()
+{
+    # hci0 必须已经出现在蓝牙 sysfs 类目录中。
+    [ -d "/sys/class/bluetooth/$BT_HCI_DEVICE" ] || return 1
+
+    # 当前产品只允许 hci_uart 注册蓝牙控制器，禁止依赖未随精简 rootfs 提供的 hciconfig。
+    [ -d /sys/module/hci_uart ] || return 1
+}
+
+# 正常停止由指定进程号文件管理的进程。
+stop_pid_file()
+{
+    # 目标进程不存在时只清理失效进程号文件。
+    if ! is_pid_running "$1"; then
+        rm -f "$1"
+        return 0
+    fi
+
+    # 保存目标进程号，避免后续状态查询覆盖全局变量。
+    STOP_PID="$SERVICE_PID"
+
+    # 发送正常终止信号，先给线路规程和守护进程正常退出机会。
+    kill "$STOP_PID" 2>/dev/null || return 1
+
+    # 最多等待五秒，确保线路规程和 D-Bus 名称完成释放。
+    WAITED_SECONDS="0"
+    while kill -0 "$STOP_PID" 2>/dev/null && [ "$WAITED_SECONDS" -lt 5 ]; do
+        sleep 1
+        WAITED_SECONDS=$((WAITED_SECONDS + 1))
+    done
+
+    # 超时后只对确认仍是原目标进程的 PID 发送一次强制终止，避免服务脚本永久阻塞。
+    if kill -0 "$STOP_PID" 2>/dev/null; then
+        echo "WARN: process $STOP_PID did not stop normally; forcing termination" >&2
+        kill -KILL "$STOP_PID" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$STOP_PID" 2>/dev/null; then
+            echo "ERROR: process $STOP_PID could not be terminated" >&2
+            return 1
+        fi
+    fi
+
+    # 正常退出后删除进程号文件。
+    rm -f "$1"
+}
+
+# 校验 RTL8723DS 蓝牙运行依赖完整存在。
+check_files()
+{
+    # 校验固定配置文件可读。
+    [ -r "$BLUETOOTH_CONFIG" ] || return 1
+
+    # 校验内核模块可读。
+    [ -r "$HCI_UART_MODULE" ] || return 1
+
+    # 校验 Realtek 初始化工具可执行。
+    [ -x "$HCI_ATTACH_BIN" ] || return 1
+
+    # 校验固件与板级配置完整。
+    [ -r "$RTL_FIRMWARE_FILE" ] || return 1
+    [ -r "$RTL_CONFIG_FILE" ] || return 1
+
+    # 校验 D-Bus、BlueZ、BlueALSA 和控制命令完整。
+    [ -x "$DBUS_DAEMON_BIN" ] || return 1
+    [ -r "$DBUS_CONFIG" ] || return 1
+    [ -x "$BLUETOOTH_DAEMON_BIN" ] || return 1
+    [ -x "$BLUEALSA_DAEMON_BIN" ] || return 1
+    [ -x "$BLUETOOTHCTL_BIN" ] || return 1
+}
+
+# 启动系统 D-Bus。
+start_dbus()
+{
+    # 创建 D-Bus 运行目录和持久化目录。
+    mkdir -p /run/dbus /var/lib/dbus
+
+    # 首次启动时为当前设备生成唯一 machine-id。
+    if [ ! -s /var/lib/dbus/machine-id ]; then
+        tr -d '-' </proc/sys/kernel/random/uuid > /var/lib/dbus/machine-id.new
+        [ "$(wc -c </var/lib/dbus/machine-id.new)" -eq 33 ] || return 1
+        mv /var/lib/dbus/machine-id.new /var/lib/dbus/machine-id
+    fi
+
+    # 已存在系统总线套接字时不重复启动。
+    [ -S /run/dbus/system_bus_socket ] && return 0
+
+    # 使用 SDK 固定配置启动系统消息总线。
+    "$DBUS_DAEMON_BIN" --config-file="$DBUS_CONFIG" --fork
+}
+
+# 启动必联 RTL8723DS UART 蓝牙控制器。
+start_rtl8723ds_hci()
+{
+    # 禁止同时使用 WS73 自带蓝牙，避免注册错误的 hci0。
+    if [ -d /sys/module/ble_soc ]; then
+        echo "ERROR: forbidden WS73 ble_soc module is loaded" >&2
+        return 1
+    fi
+
+    # 校验历史硬件接线对应的 UART1 字符设备。
+    [ -c "$BT_UART_DEVICE" ] || {
+        echo "ERROR: RTL8723DS UART device is missing: $BT_UART_DEVICE" >&2
+        return 1
+    }
+
+    # 已注册控制器时要求它确实来自 UART 总线。
+    if controller_ready; then
+        return 0
+    fi
+
+    # 内核尚未加载 Realtek H5 线路规程模块时加载固定模块。
+    if [ ! -d /sys/module/hci_uart ]; then
+        insmod "$HCI_UART_MODULE" || return 1
+    fi
+
+    # 清理失效的旧绑定进程号文件。
+    stop_pid_file "$HCI_ATTACH_PID_FILE" || return 1
+
+    # 下载固件并将 ttyAMA1 绑定到 Realtek H5 线路规程。
+    "$HCI_ATTACH_BIN" -n -s "$BT_UART_INITIAL_BAUD" "$BT_UART_DEVICE" "$BT_UART_PROTOCOL" >>"$BLUETOOTH_LOG_FILE" 2>&1 &
+
+    # 保存长期驻留的线路规程进程号。
+    echo "$!" >"$HCI_ATTACH_PID_FILE"
+
+    # 在固定时限内等待 hci0 注册。
+    HCI_WAITED_SECONDS="0"
+    while [ ! -d "/sys/class/bluetooth/$BT_HCI_DEVICE" ]; do
+        # 固件下载进程提前退出时立即报告失败。
+        is_pid_running "$HCI_ATTACH_PID_FILE" || return 1
+
+        # 达到固定超时时间后停止等待。
+        [ "$HCI_WAITED_SECONDS" -lt "$BT_HCI_WAIT_SECONDS" ] || return 1
+
+        # 每秒检查一次控制器状态。
+        sleep 1
+        HCI_WAITED_SECONDS=$((HCI_WAITED_SECONDS + 1))
+    done
+
+    # 最终验收控制器总线，防止误把其他蓝牙控制器当成必联模组。
+    controller_ready
+}
+
+# 启动 BlueZ 和 A2DP Source 音频服务。
+start_audio_services()
+{
+    # 创建 BlueZ 和 BlueALSA 的持久化状态目录。
+    mkdir -p /var/lib/bluetooth /var/lib/bluealsa
+
+    # 确保旧 BlueZ 进程已经正常退出。
+    stop_pid_file "$BLUETOOTH_DAEMON_PID_FILE" || return 1
+
+    # 启动 BlueZ 并保存进程号。
+    "$BLUETOOTH_DAEMON_BIN" --nodetach >>"$BLUETOOTH_LOG_FILE" 2>&1 &
+    echo "$!" >"$BLUETOOTH_DAEMON_PID_FILE"
+
+    # 等待 BlueZ 注册系统总线服务。
+    sleep 1
+    is_pid_running "$BLUETOOTH_DAEMON_PID_FILE" || return 1
+    "$BLUETOOTHCTL_BIN" --timeout 5 show >/dev/null 2>&1 || return 1
+
+    # 明确打开 UART 控制器，避免 hci0 注册后仍处于 Network is down 状态。
+    "$BLUETOOTHCTL_BIN" --timeout 5 power on >>"$BLUETOOTH_LOG_FILE" 2>&1 || return 1
+
+    # 只有 BlueZ 明确报告 Powered: yes 才允许启动 A2DP Source。
+    "$BLUETOOTHCTL_BIN" --timeout 5 show 2>/dev/null | grep -q 'Powered: yes' || return 1
+
+    # 确保旧 BlueALSA 进程已经正常退出。
+    stop_pid_file "$BLUEALSA_DAEMON_PID_FILE" || return 1
+
+    # 启动仅包含 A2DP Source 的 BlueALSA 服务。
+    "$BLUEALSA_DAEMON_BIN" --device="$BT_HCI_DEVICE" --profile="$BT_BLUEALSA_PROFILE" >>"$BLUETOOTH_LOG_FILE" 2>&1 &
+    echo "$!" >"$BLUEALSA_DAEMON_PID_FILE"
+
+    # 等待 BlueALSA 完成 D-Bus 注册。
+    sleep 1
+    is_pid_running "$BLUEALSA_DAEMON_PID_FILE"
+}
+
+# 启动完整的必联经典蓝牙音频服务。
+start_bluetooth_audio()
+{
+    # 缺少任何正式运行文件时拒绝启动。
+    check_files || {
+        echo "ERROR: RTL8723DS Bluetooth files are not completely installed" >&2
+        return 1
+    }
+
+    # 读取固定板级参数。
+    . "$BLUETOOTH_CONFIG"
+
+    # 清空本次启动日志，避免临时日志无限增长。
+    : >"$BLUETOOTH_LOG_FILE"
+
+    # 先启动消息总线，再注册控制器和上层音频服务。
+    start_dbus || return 1
+    start_rtl8723ds_hci || return 1
+    start_audio_services || return 1
+
+    # 输出串口可见的明确成功信息。
+    echo "RTL8723DS Bluetooth audio service started on $BT_UART_DEVICE"
+}
+
+# 按依赖逆序正常停止蓝牙服务。
+stop_bluetooth_audio()
+{
+    # 任一步骤失败都保留错误状态供运维检查。
+    STOP_RESULT="0"
+
+    # 先停止音频和 BlueZ，再解除 UART 线路规程。
+    stop_pid_file "$BLUEALSA_DAEMON_PID_FILE" || STOP_RESULT="1"
+    stop_pid_file "$BLUETOOTH_DAEMON_PID_FILE" || STOP_RESULT="1"
+    stop_pid_file "$HCI_ATTACH_PID_FILE" || STOP_RESULT="1"
+
+    # 线路规程正常释放后卸载独立 HCI UART 模块。
+    if [ "$STOP_RESULT" -eq 0 ] && [ -d /sys/module/hci_uart ]; then
+        # rmmod 由内核引用计数控制，必须设置上限，避免驱动异常时卡住整个串口 shell。
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 3 rmmod hci_uart 2>/dev/null || STOP_RESULT="1"
+        else
+            rmmod hci_uart 2>/dev/null || STOP_RESULT="1"
+        fi
+    fi
+
+    # 返回完整停止结果，禁止静默吞掉异常。
+    [ "$STOP_RESULT" -eq 0 ]
+}
+
+# 输出必联蓝牙所有关键组件状态。
+show_status()
+{
+    # 读取固定板级参数供状态检查使用。
+    . "$BLUETOOTH_CONFIG" 2>/dev/null || return 1
+
+    # 任一关键组件异常时最终返回非零状态。
+    BLUETOOTH_HEALTHY="1"
+
+    # WS73 蓝牙模块在正式产品中必须保持未加载。
+    if [ -d /sys/module/ble_soc ]; then
+        echo "ble_soc: forbidden-loaded"
+        BLUETOOTH_HEALTHY="0"
+    else
+        echo "ble_soc: not-loaded"
+    fi
+
+    # 必联控制器必须注册为 UART 类型的 hci0。
+    if controller_ready; then
+        echo "$BT_HCI_DEVICE: ready (UART)"
+    else
+        echo "$BT_HCI_DEVICE: unavailable-or-not-UART"
+        BLUETOOTH_HEALTHY="0"
+    fi
+
+    # HCI 固件下载和线路规程进程必须长期运行。
+    if is_pid_running "$HCI_ATTACH_PID_FILE"; then
+        echo "rtk_hciattach: running"
+    else
+        echo "rtk_hciattach: stopped"
+        BLUETOOTH_HEALTHY="0"
+    fi
+
+    # BlueZ 必须同时具备进程和 D-Bus 控制能力。
+    if is_pid_running "$BLUETOOTH_DAEMON_PID_FILE" && "$BLUETOOTHCTL_BIN" --timeout 5 show >/dev/null 2>&1; then
+        echo "bluetoothd: running"
+    else
+        echo "bluetoothd: stopped"
+        BLUETOOTH_HEALTHY="0"
+    fi
+
+    # BlueALSA 必须正常运行。
+    if is_pid_running "$BLUEALSA_DAEMON_PID_FILE"; then
+        echo "bluealsad: running"
+    else
+        echo "bluealsad: stopped"
+        BLUETOOTH_HEALTHY="0"
+    fi
+
+    # 所有项目同时正常才允许服务验收通过。
+    [ "$BLUETOOTH_HEALTHY" -eq 1 ]
+}
+
+# 根据 SysV 参数执行服务操作。
+case "${1:-start}" in
+    start)
+        start_bluetooth_audio
+        ;;
+    stop)
+        stop_bluetooth_audio
+        ;;
+    restart)
+        stop_bluetooth_audio && start_bluetooth_audio
+        ;;
+    status)
+        show_status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

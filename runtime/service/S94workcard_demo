@@ -1,0 +1,181 @@
+#!/bin/sh
+
+# 任一服务管理错误都立即返回，避免误报启动成功。
+set -eu
+
+# 定义客户 Demo 的固定安装目录。
+DEMO_ROOT="/opt/workcard-demo"
+
+# 定义客户 Demo 可执行文件。
+DEMO_BIN="$DEMO_ROOT/workcard-demo"
+
+# 定义客户 Demo 的真实配置文件。
+DEMO_CONFIG="$DEMO_ROOT/workcard-demo.conf"
+
+# 定义 Demo 运行进程号文件。
+DEMO_PID_FILE="/run/workcard-demo.pid"
+
+# 定义 Demo 启动包装进程号文件。
+WRAPPER_PID_FILE="/run/workcard-demo-wrapper.pid"
+
+# 定义跨重启保存的 Demo 业务日志。
+DEMO_LOG_FILE="$DEMO_ROOT/log/workcard-demo.log"
+
+# 定义跨重启保存的 Demo 进程退出日志。
+DEMO_EXIT_LOG_FILE="$DEMO_ROOT/log/workcard-demo-exit.log"
+
+# 固定使用 SDK 私有运行库并回退到 rootfs 系统库。
+export LD_LIBRARY_PATH="/opt/workcard-sdk/lib:/lib:/usr/lib"
+
+# 判断指定 PID 文件中的进程是否仍然存在。
+pid_file_is_running()
+{
+    # PID 文件不存在时直接报告未运行。
+    [ -r "$1" ] || return 1
+
+    # 读取 PID 并确认进程仍可发送信号。
+    RUNNING_PID="$(cat "$1" 2>/dev/null || true)"
+    [ -n "$RUNNING_PID" ] && kill -0 "$RUNNING_PID" 2>/dev/null
+}
+
+# 记录并清理 Demo 进程退出状态。
+run_demo()
+{
+    # 记录本轮 Demo 启动时间和配置路径。
+    printf 'start_time=%s config=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$DEMO_CONFIG" >>"$DEMO_EXIT_LOG_FILE"
+
+    # 忽略 HUP，避免启动终端或 SSH 断开时误杀客户 Demo。
+    trap ':' HUP
+
+    # 捕获正常停止信号并转发给真实 Demo，保证 MQTT 离线状态正常发布。
+    trap 'if [ -n "${CHILD_PID:-}" ] && kill -0 "$CHILD_PID" 2>/dev/null; then kill -TERM "$CHILD_PID" 2>/dev/null || true; fi' INT TERM
+
+    # 启动客户 Demo 并保存真实子进程 PID。
+    "$DEMO_BIN" --config "$DEMO_CONFIG" &
+    CHILD_PID="$!"
+    printf '%s\n' "$CHILD_PID" >"$DEMO_PID_FILE"
+
+    # 等待真实 Demo 结束并在 set -e 下显式保留非零退出状态。
+    if wait "$CHILD_PID"; then
+        DEMO_STATUS="0"
+    else
+        DEMO_STATUS="$?"
+    fi
+
+    # 记录退出码；128以上的退出码表示被对应信号终止。
+    printf 'exit_time=%s exit_status=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$DEMO_STATUS" >>"$DEMO_EXIT_LOG_FILE"
+
+    # 只删除本轮生成的 PID 文件，避免残留假进程状态。
+    rm -f "$DEMO_PID_FILE" "$WRAPPER_PID_FILE"
+
+    # 将 Demo 的退出状态返回给包装进程。
+    return "$DEMO_STATUS"
+}
+
+# 启动客户 Demo 服务。
+start_demo()
+{
+    # 已经运行时不重复创建第二个 MQTT 客户端。
+    if pid_file_is_running "$DEMO_PID_FILE" || pid_file_is_running "$WRAPPER_PID_FILE"; then
+        echo "workcard-demo: running"
+        return 0
+    fi
+
+    # 检查正式配置，不允许使用示例配置启动并产生假在线状态。
+    if [ ! -r "$DEMO_CONFIG" ]; then
+        printf 'start_time=%s error=missing_config path=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$DEMO_CONFIG" >>"$DEMO_EXIT_LOG_FILE"
+        echo "workcard-demo: missing configuration: $DEMO_CONFIG" >&2
+        return 66
+    fi
+
+    # 后台运行包装函数，标准输出和错误统一进入持久化日志。
+    run_demo >>"$DEMO_LOG_FILE" 2>&1 </dev/null &
+    printf '%s\n' "$!" >"$WRAPPER_PID_FILE"
+
+    # 给 shell 完成 PID 文件写入和 Demo 初始化的时间。
+    sleep 1
+    if pid_file_is_running "$WRAPPER_PID_FILE"; then
+        echo "workcard-demo: started"
+        return 0
+    fi
+
+    # 包装进程已立即退出时返回失败，便于串口和后台部署脚本发现。
+    echo "workcard-demo: failed to start" >&2
+    return 1
+}
+
+# 停止客户 Demo 服务并等待资源释放。
+stop_demo()
+{
+    # 优先停止包装进程，由其向真实 Demo 转发 SIGTERM。
+    if pid_file_is_running "$WRAPPER_PID_FILE"; then
+        STOP_PID="$(cat "$WRAPPER_PID_FILE")"
+        kill -TERM "$STOP_PID" 2>/dev/null || true
+    elif pid_file_is_running "$DEMO_PID_FILE"; then
+        STOP_PID="$(cat "$DEMO_PID_FILE")"
+        kill -TERM "$STOP_PID" 2>/dev/null || true
+    else
+        rm -f "$DEMO_PID_FILE" "$WRAPPER_PID_FILE"
+        echo "workcard-demo: stopped"
+        return 0
+    fi
+
+    # 最多等待十五秒，避免服务脚本永久卡住启动流程。
+    WAITED_SECONDS=0
+    while (pid_file_is_running "$WRAPPER_PID_FILE" || pid_file_is_running "$DEMO_PID_FILE") && [ "$WAITED_SECONDS" -lt 15 ]; do
+        sleep 1
+        WAITED_SECONDS=$((WAITED_SECONDS + 1))
+    done
+
+    # 超时只记录事实，不强制 SIGKILL 媒体进程，避免再次触发 HAL 锁死风险。
+    if pid_file_is_running "$WRAPPER_PID_FILE" || pid_file_is_running "$DEMO_PID_FILE"; then
+        printf 'stop_time=%s error=stop_timeout\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >>"$DEMO_EXIT_LOG_FILE"
+        echo "workcard-demo: stop timeout" >&2
+        return 1
+    fi
+
+    echo "workcard-demo: stopped"
+    return 0
+}
+
+# 查询客户 Demo 当前运行状态。
+status_demo()
+{
+    # 输出稳定的机器可读状态文本。
+    if pid_file_is_running "$DEMO_PID_FILE" || pid_file_is_running "$WRAPPER_PID_FILE"; then
+        echo "workcard-demo: running"
+        return 0
+    fi
+    echo "workcard-demo: stopped"
+    return 1
+}
+
+# 创建日志目录并限制日志只允许 root 访问。
+prepare_demo_runtime()
+{
+    install -d -m 0700 "$DEMO_ROOT/log"
+    touch "$DEMO_LOG_FILE" "$DEMO_EXIT_LOG_FILE"
+    chmod 0600 "$DEMO_LOG_FILE" "$DEMO_EXIT_LOG_FILE"
+}
+
+# 根据 SysV 参数执行对应服务动作；固定 rootfs 启动框架无参数调用时默认执行启动。
+prepare_demo_runtime
+case "${1:-start}" in
+    start)
+        start_demo
+        ;;
+    stop)
+        stop_demo
+        ;;
+    restart)
+        stop_demo || true
+        start_demo
+        ;;
+    status)
+        status_demo
+        ;;
+    *)
+        echo "用法: $0 {start|stop|restart|status}" >&2
+        exit 64
+        ;;
+esac

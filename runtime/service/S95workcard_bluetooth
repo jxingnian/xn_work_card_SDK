@@ -1,0 +1,87 @@
+#!/bin/sh
+
+# 任一服务管理错误都立即返回。
+set -eu
+
+# 定义蓝牙专用 Agent 安装目录和运行文件。
+AGENT_ROOT="/opt/workcard-bluetooth"
+AGENT_BIN="$AGENT_ROOT/workcard-bluetooth-agent"
+AGENT_CONFIG="$AGENT_ROOT/mqtt.conf"
+DEMO_CONFIG="/opt/workcard-demo/workcard-demo.conf"
+PID_FILE="/run/workcard-bluetooth-agent.pid"
+LOG_FILE="$AGENT_ROOT/workcard-bluetooth-agent.log"
+
+# 从客户 Demo 配置中读取一个确定键值。
+read_demo_value()
+{
+    # 只读取首个完全匹配的键，避免子串字段产生歧义。
+    sed -n "s/^$1=//p" "$DEMO_CONFIG" | sed -n '1p'
+}
+
+# 判断 PID 文件记录的进程是否仍然运行。
+pid_is_running()
+{
+    [ -r "$PID_FILE" ] || return 1
+    RUNNING_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+    [ -n "$RUNNING_PID" ] && kill -0 "$RUNNING_PID" 2>/dev/null
+}
+
+# 根据 Demo 配置生成只允许 root 读取的蓝牙 Agent 配置。
+prepare_config()
+{
+    [ -r "$DEMO_CONFIG" ] || return 66
+    TEMP_CONFIG="$AGENT_CONFIG.tmp"
+    {
+        printf 'host=%s\n' "$(read_demo_value mqtt_host)"
+        printf 'port=%s\n' "$(read_demo_value mqtt_port)"
+        printf 'ca_file=%s\n' "$(read_demo_value ca_file)"
+        printf 'device_id=%s\n' "$(read_demo_value device_id)"
+        printf 'username=%s\n' "$(read_demo_value mqtt_username)"
+        printf 'password=%s\n' "$(read_demo_value mqtt_password)"
+        printf 'state_file=%s\n' "$AGENT_ROOT/device-state.json"
+    } >"$TEMP_CONFIG"
+    chmod 0600 "$TEMP_CONFIG"
+    mv -f "$TEMP_CONFIG" "$AGENT_CONFIG"
+}
+
+# 启动蓝牙专用 MQTT Agent。
+start_agent()
+{
+    if pid_is_running; then
+        echo "workcard-bluetooth-agent: running"
+        return 0
+    fi
+    [ -x "$AGENT_BIN" ] || return 66
+    prepare_config
+    export LD_LIBRARY_PATH="/opt/workcard-sdk/lib:/lib:/usr/lib"
+    "$AGENT_BIN" --config "$AGENT_CONFIG" --bluetooth-only >>"$LOG_FILE" 2>&1 </dev/null &
+    printf '%s\n' "$!" >"$PID_FILE"
+    sleep 1
+    pid_is_running
+    echo "workcard-bluetooth-agent: started"
+}
+
+# 正常停止蓝牙专用 MQTT Agent。
+stop_agent()
+{
+    if pid_is_running; then
+        STOP_PID="$(cat "$PID_FILE")"
+        kill -TERM "$STOP_PID" 2>/dev/null || true
+        WAITED=0
+        while kill -0 "$STOP_PID" 2>/dev/null && [ "$WAITED" -lt 10 ]; do
+            sleep 1
+            WAITED=$((WAITED + 1))
+        done
+    fi
+    rm -f "$PID_FILE"
+    echo "workcard-bluetooth-agent: stopped"
+}
+
+# 根据 SysV 参数执行服务动作。
+case "${1:-start}" in
+    start) start_agent ;;
+    stop) stop_agent ;;
+    restart) stop_agent && start_agent ;;
+    status) pid_is_running && echo "workcard-bluetooth-agent: running" ;;
+    *) echo "用法: $0 {start|stop|restart|status}" >&2; exit 64 ;;
+esac

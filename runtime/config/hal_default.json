@@ -1,0 +1,19 @@
+{
+    "platform": "hi3516cv610",
+    "board": "hongou_lite",
+    "chip_id": 3516610,
+    "audio": {
+        "ai": [],
+        "ao": [],
+        "aenc": [],
+        "adec": []
+    },
+    "video": {
+        "vi": [],
+        "vpss": [],
+        "venc": []
+    },
+    "region": [],
+    "pipeline": []
+}
+

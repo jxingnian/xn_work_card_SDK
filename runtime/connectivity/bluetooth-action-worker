@@ -1,0 +1,46 @@
+#!/bin/sh
+
+# 任意配对、信任或连接失败时立即停止。
+set -eu
+
+# 读取已经由 C++ 严格校验的蓝牙地址和结果文件。
+BLUETOOTH_ADDRESS="$1"
+OUTPUT_FILE="$2"
+
+# 使用临时文件记录本次执行结果。
+TEMP_FILE="${OUTPUT_FILE}.tmp"
+
+# 初始化配对、信任和连接结果，异常退出时不会留下虚假成功。
+printf 'paired=0\ntrusted=0\nconnected=0\n' >"$TEMP_FILE"
+
+# 在五秒命令超时内打开控制器，避免 D-Bus 异常时动作进程长期占用。
+bluetoothctl --timeout 5 power on >/dev/null 2>&1
+
+# 未配对设备先执行带超时配对，已配对时保持幂等。
+if ! bluetoothctl --timeout 5 info "$BLUETOOTH_ADDRESS" 2>/dev/null | grep -q 'Paired: yes'; then
+    bluetoothctl --timeout 20 pair "$BLUETOOTH_ADDRESS" >/dev/null 2>&1
+fi
+
+# 读取配对状态，明确区分配对失败和后续连接失败。
+if bluetoothctl --timeout 5 info "$BLUETOOTH_ADDRESS" 2>/dev/null | grep -q 'Paired: yes'; then
+    sed -i 's/^paired=0$/paired=1/' "$TEMP_FILE"
+fi
+
+# 信任已选耳机，允许设备后续自动重连。
+bluetoothctl --timeout 5 trust "$BLUETOOTH_ADDRESS" >/dev/null 2>&1
+
+# 读取信任状态，明确记录 BlueZ 是否接受了信任设置。
+if bluetoothctl --timeout 5 info "$BLUETOOTH_ADDRESS" 2>/dev/null | grep -q 'Trusted: yes'; then
+    sed -i 's/^trusted=0$/trusted=1/' "$TEMP_FILE"
+fi
+
+# 建立 A2DP 连接并等待 BlueZ 完成 Profile 协商。
+bluetoothctl --timeout 20 connect "$BLUETOOTH_ADDRESS" >/dev/null 2>&1
+
+# 只在 BlueZ 明确报告已连接时写入成功结果。
+if bluetoothctl --timeout 5 info "$BLUETOOTH_ADDRESS" 2>/dev/null | grep -q 'Connected: yes'; then
+    sed -i 's/^connected=0$/connected=1/' "$TEMP_FILE"
+fi
+
+# 原子发布动作结果。
+mv "$TEMP_FILE" "$OUTPUT_FILE"

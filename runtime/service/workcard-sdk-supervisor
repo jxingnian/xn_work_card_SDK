@@ -1,0 +1,105 @@
+#!/bin/sh
+
+# 定义 SDK 正式安装根目录。
+SDK_ROOT="/opt/workcard-sdk"
+
+# 定义底层硬件服务程序。
+SERVICE_BIN="$SDK_ROOT/bin/workcard-sdk-service"
+
+# 定义当前服务子进程号文件。
+SERVICE_PID_FILE="/run/workcard-sdk-service.pid"
+
+# 定义 supervisor 收到停止请求时使用的内存标志。
+STOP_FILE="/run/workcard-sdk/stop.requested"
+
+# 定义媒体服务异常退出后必须冷启动恢复的保护标志。
+REBOOT_REQUIRED_FILE="/run/workcard-sdk/reboot.required"
+
+# 定义底层服务连续运行日志。
+SERVICE_LOG_FILE="/tmp/workcard-sdk-service.log"
+
+# 定义只记录启动时间和退出状态的诊断日志。
+EXIT_LOG_FILE="/tmp/workcard-sdk-service-exit.log"
+
+# 保存当前正在监督的服务子进程号。
+SERVICE_PID=""
+
+# 保存 supervisor 是否已经收到正常停止请求。
+STOP_REQUESTED="0"
+
+# 在停止信号到达时转发信号并阻止自动重启。
+request_stop()
+{
+    # 标记本次退出属于服务管理流程。
+    STOP_REQUESTED="1"
+
+    # 创建只存在于本次启动周期的停止标志。
+    : >"$STOP_FILE"
+
+    # 当前子进程仍存在时转发正常终止信号。
+    if [ -n "$SERVICE_PID" ] && kill -0 "$SERVICE_PID" 2>/dev/null; then
+        kill -TERM "$SERVICE_PID" 2>/dev/null || true
+    fi
+}
+
+# 注册 supervisor 的正常停止信号。
+trap request_stop INT TERM
+
+# 创建运行目录并清理上次启动遗留的停止标志。
+mkdir -p /run/workcard-sdk
+rm -f "$STOP_FILE"
+
+# 只使用 SDK 自有运行库和固定 rootfs 系统库。
+export LD_LIBRARY_PATH="$SDK_ROOT/lib:/lib:/usr/lib"
+
+# 固定服务工作目录以正确解析 HAL 配置。
+cd "$SDK_ROOT" || exit 125
+
+# 禁止底层服务生成可能包含运行状态的 core dump。
+ulimit -c 0
+
+# supervisor 只运行一轮真实服务，禁止在 HAL 状态未知时原地重复初始化媒体硬件。
+while [ "$STOP_REQUESTED" -eq 0 ]; do
+    # 启动前记录可对应串口和业务日志的时间。
+    date '+start_time=%Y-%m-%dT%H:%M:%S%z' >>"$EXIT_LOG_FILE"
+
+    # 后台启动真实服务并继承固定日志输出。
+    "$SERVICE_BIN" >>"$SERVICE_LOG_FILE" 2>&1 &
+
+    # 保存本轮真实服务进程号。
+    SERVICE_PID="$!"
+    echo "$SERVICE_PID" >"$SERVICE_PID_FILE"
+
+    # 等待服务正常退出或被信号终止并保留完整 shell 状态码。
+    wait "$SERVICE_PID"
+    SERVICE_STATUS="$?"
+
+    # 信号打断 wait 时继续等待子进程真正退出，避免留下脱离监督的服务进程。
+    while kill -0 "$SERVICE_PID" 2>/dev/null; do
+        sleep 1
+    done
+
+    # 子进程已经结束后删除失效进程号文件。
+    rm -f "$SERVICE_PID_FILE"
+
+    # 记录退出状态，状态码大于等于一百二十八时表示收到对应信号。
+    date '+exit_time=%Y-%m-%dT%H:%M:%S%z' >>"$EXIT_LOG_FILE"
+    echo "exit_status=$SERVICE_STATUS" >>"$EXIT_LOG_FILE"
+
+    # 正常服务管理停止时直接结束监督程序。
+    if [ "$STOP_REQUESTED" -ne 0 ] || [ -e "$STOP_FILE" ]; then
+        break
+    fi
+
+    # 异常退出后写入保护标志，拒绝在未冷启动时重新初始化厂商媒体 HAL。
+    : >"$REBOOT_REQUIRED_FILE"
+
+    # 异常退出后结束监督程序，由运维流程执行整板冷启动恢复。
+    break
+done
+
+# 清理本次 supervisor 的运行状态。
+rm -f "$SERVICE_PID_FILE" "$STOP_FILE"
+
+# supervisor 正常结束。
+exit 0

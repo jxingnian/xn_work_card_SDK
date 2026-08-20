@@ -1,0 +1,258 @@
+#!/bin/sh
+
+# 保存调用方指定的 Wi-Fi 配置文件。
+WIFI_CONFIG="${1:-/opt/workcard-connectivity/wifi.conf}"
+
+# 定义 Work Card SDK 写入的派生 PSK 多网络配置文件。
+MULTI_WPA_CONFIG="/opt/workcard-sdk/state/wpa-supplicant.conf"
+
+# 定义旧单 Wi-Fi 凭据只允许生成的内存临时配置文件。
+LEGACY_WPA_CONFIG="/run/xingnian-wpa-supplicant.conf"
+
+# 启动时优先使用已经存在的多网络配置。
+if [ -s "$MULTI_WPA_CONFIG" ]; then
+    ACTIVE_WPA_CONFIG="$MULTI_WPA_CONFIG"
+else
+    ACTIVE_WPA_CONFIG="$LEGACY_WPA_CONFIG"
+fi
+
+# 定义服务专用 wpa_supplicant PID 文件。
+WPA_PID_FILE="/run/xingnian-wpa-supplicant.pid"
+
+# 定义服务专用 DHCP PID 文件。
+DHCP_PID_FILE="/run/xingnian-wifi-udhcpc.pid"
+
+# 定义网络就绪状态文件。
+READY_FILE="/run/xingnian-wifi.ready"
+
+# 限制配置文件只能包含预期变量后再加载。
+# 先收集不符合单引号变量格式的配置行，避免 grep 空输出导致判断含义反转。
+INVALID_LINES="$(sed '/^[[:space:]]*#/d;/^[[:space:]]*$/d' "$WIFI_CONFIG" | grep -Ev "^(WIFI_SSID|WIFI_PASSWORD|WIFI_INTERFACE)='[^']*'$" || true)"
+
+# 仅在没有非法配置行时加载配置，禁止任意 shell 命令注入服务进程。
+if [ -z "$INVALID_LINES" ]; then
+    . "$WIFI_CONFIG"
+else
+    echo "ERROR: invalid Wi-Fi configuration format"
+    exit 1
+fi
+
+# 校验三个必填配置值。
+if [ -z "${WIFI_SSID:-}" ] || [ -z "${WIFI_PASSWORD:-}" ] || [ -z "${WIFI_INTERFACE:-}" ]; then
+    echo "ERROR: incomplete Wi-Fi configuration"
+    exit 1
+fi
+
+# 限制 SSID 和密码字符，避免生成无效 wpa_supplicant 文件。
+case "$WIFI_SSID$WIFI_PASSWORD" in
+    *'"'*|*'\'*)
+        echo "ERROR: Wi-Fi credentials contain unsupported quote characters"
+        exit 1
+        ;;
+esac
+
+# 停止本服务创建的 Wi-Fi 用户态进程。
+stop_clients()
+{
+    # 逐个处理 wpa_supplicant 和 DHCP PID 文件。
+    for PID_FILE in "$WPA_PID_FILE" "$DHCP_PID_FILE"; do
+        # PID 文件存在时读取进程编号。
+        if [ -f "$PID_FILE" ]; then
+            CLIENT_PID="$(cat "$PID_FILE" 2>/dev/null)"
+            # 进程仍存活时发送正常退出信号。
+            if [ -n "$CLIENT_PID" ] && kill -0 "$CLIENT_PID" 2>/dev/null; then
+                kill "$CLIENT_PID"
+            fi
+            # 删除已经失效的 PID 文件。
+            rm -f "$PID_FILE"
+        fi
+    done
+
+    # 清除旧网络就绪状态。
+    rm -f "$READY_FILE"
+}
+
+# 只停止 DHCP 客户端并保留长期运行的 wpa_supplicant。
+stop_dhcp()
+{
+    # DHCP PID 文件不存在时只清理网络就绪状态。
+    if [ ! -f "$DHCP_PID_FILE" ]; then
+        rm -f "$READY_FILE"
+        return 0
+    fi
+
+    # 读取并停止本服务创建的 DHCP 进程。
+    DHCP_PID="$(cat "$DHCP_PID_FILE" 2>/dev/null)"
+    if [ -n "$DHCP_PID" ] && kill -0 "$DHCP_PID" 2>/dev/null; then
+        kill "$DHCP_PID"
+    fi
+
+    # 删除失效 PID 和就绪状态。
+    rm -f "$DHCP_PID_FILE" "$READY_FILE"
+}
+
+# 收到服务停止信号时释放用户态进程。
+trap 'stop_clients; exit 0' INT TERM
+
+# 加载出厂固件提供的 WS73 平台和 Wi-Fi 驱动。
+load_ws73_modules()
+{
+    # 已经存在 wlan0 时说明驱动处于可用状态。
+    if ifconfig "$WIFI_INTERFACE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # 在出厂固件标准路径中查找平台模块。
+    PLAT_MODULE="/komod/extdrv/plat_soc.ko"
+    WIFI_MODULE="/komod/extdrv/wifi_soc.ko"
+
+    # 兼容易百纳应用目录中的官方模块位置。
+    if [ ! -f "$PLAT_MODULE" ]; then
+        PLAT_MODULE="/opt/HongOU_Lite_XL_CV610/ko/extdrv/plat_soc.ko"
+        WIFI_MODULE="/opt/HongOU_Lite_XL_CV610/ko/extdrv/wifi_soc.ko"
+    fi
+
+    # 模块文件缺失时返回明确错误。
+    if [ ! -f "$PLAT_MODULE" ] || [ ! -f "$WIFI_MODULE" ]; then
+        echo "ERROR: WS73 driver modules were not found"
+        return 1
+    fi
+
+    # 平台模块未加载时执行加载。
+    grep -q '^plat_soc ' /proc/modules 2>/dev/null || insmod "$PLAT_MODULE" || return 1
+
+    # Wi-Fi 模块未加载时执行加载。
+    grep -q '^wifi_soc ' /proc/modules 2>/dev/null || insmod "$WIFI_MODULE" || return 1
+
+    # 等待驱动创建无线接口。
+    sleep 2
+
+    # 校验无线接口已经出现。
+    ifconfig "$WIFI_INTERFACE" >/dev/null 2>&1
+}
+
+# 生成权限受限的 WPA2 客户端配置。
+write_initial_wpa_config()
+{
+    # MQTT 多 Wi-Fi 配置已经存在时无需创建旧临时配置。
+    if [ -s "$MULTI_WPA_CONFIG" ]; then
+        return 0
+    fi
+
+    # 临时限制新文件只允许 root 访问。
+    umask 077
+
+    # 生成 WS73 客户端连接配置。
+    {
+        echo "ctrl_interface=/var/run/wpa_supplicant"
+        echo "update_config=0"
+        echo "network={"
+        echo "    ssid=\"$WIFI_SSID\""
+        echo "    psk=\"$WIFI_PASSWORD\""
+        echo "    key_mgmt=WPA-PSK"
+        echo "}"
+    } >"$LEGACY_WPA_CONFIG"
+}
+
+# 判断无线接口是否已经获取 IPv4 地址。
+has_ipv4_address()
+{
+    # 兼容 BusyBox ifconfig 的 inet addr 和 inet 两种输出格式。
+    ifconfig "$WIFI_INTERFACE" 2>/dev/null | grep -Eq 'inet addr:|inet '
+}
+
+# 保证唯一 wpa_supplicant 实例正在运行。
+ensure_supplicant()
+{
+    # PID 文件对应进程仍存在时保持当前无线关联状态。
+    if [ -f "$WPA_PID_FILE" ]; then
+        WPA_PID="$(cat "$WPA_PID_FILE" 2>/dev/null)"
+        if [ -n "$WPA_PID" ] && kill -0 "$WPA_PID" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # 清理失效 PID 并启动无线接口。
+    rm -f "$WPA_PID_FILE"
+    ifconfig "$WIFI_INTERFACE" up || return 1
+
+    # 启动出厂固件提供的长期运行 wpa_supplicant。
+    wpa_supplicant -B -i "$WIFI_INTERFACE" -D nl80211 -c "$ACTIVE_WPA_CONFIG" -P "$WPA_PID_FILE" || return 1
+}
+
+# 保证关联完成后存在 DHCP 地址获取流程。
+ensure_dhcp()
+{
+    # 已经取得 IPv4 时无需重复启动 DHCP。
+    if has_ipv4_address; then
+        return 0
+    fi
+
+    # 仍在运行的 DHCP 客户端继续等待响应。
+    if [ -f "$DHCP_PID_FILE" ]; then
+        DHCP_PID="$(cat "$DHCP_PID_FILE" 2>/dev/null)"
+        if [ -n "$DHCP_PID" ] && kill -0 "$DHCP_PID" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # 清理失效 PID 后后台获取地址。
+    rm -f "$DHCP_PID_FILE"
+    udhcpc -b -i "$WIFI_INTERFACE" -p "$DHCP_PID_FILE" >/tmp/xingnian-wifi-dhcp.log 2>&1 || return 1
+}
+
+# 加载驱动失败时保留守护并周期性重试。
+until load_ws73_modules; do
+    sleep 10
+done
+
+# 仅在多 Wi-Fi 配置尚不存在时从旧单 Wi-Fi 文件迁移初始配置。
+write_initial_wpa_config
+
+# 首次启动唯一 wpa_supplicant 实例。
+ensure_supplicant || true
+
+# 初始化断线扫描计数器。
+DISCONNECTED_SECONDS=0
+
+# 持续检查关联与地址，断线时自动恢复。
+while true; do
+    # 首条 MQTT 多 Wi-Fi 配置出现时从内存旧配置切换到只含派生 PSK 的正式配置。
+    if [ "$ACTIVE_WPA_CONFIG" != "$MULTI_WPA_CONFIG" ] && [ -s "$MULTI_WPA_CONFIG" ]; then
+        # 切换配置文件必须重启一次 supplicant，后续更新全部使用 reconfigure 热重载。
+        stop_clients
+        ACTIVE_WPA_CONFIG="$MULTI_WPA_CONFIG"
+        ensure_supplicant || true
+    fi
+
+    # 同时满足 WPA 已关联和获得 IPv4 时发布就绪状态。
+    if wpa_cli -i "$WIFI_INTERFACE" status 2>/dev/null | grep -q '^wpa_state=COMPLETED$' && has_ipv4_address; then
+        echo "$WIFI_INTERFACE" >"$READY_FILE"
+        DISCONNECTED_SECONDS=0
+    else
+        # 连接不完整时清除就绪状态但保持 supplicant 长期运行。
+        rm -f "$READY_FILE"
+
+        # supplicant 异常退出时只恢复该单一进程。
+        ensure_supplicant || true
+
+        # 已关联但尚无地址时启动或保留 DHCP 客户端。
+        if wpa_cli -i "$WIFI_INTERFACE" status 2>/dev/null | grep -q '^wpa_state=COMPLETED$'; then
+            ensure_dhcp || true
+            DISCONNECTED_SECONDS=0
+        else
+            # 未关联时停止无意义 DHCP 请求。
+            stop_dhcp
+
+            # 累加断线时间并每六十秒主动扫描一次保存网络。
+            DISCONNECTED_SECONDS=$((DISCONNECTED_SECONDS + 10))
+            if [ "$DISCONNECTED_SECONDS" -ge 60 ]; then
+                wpa_cli -i "$WIFI_INTERFACE" scan >/dev/null 2>&1 || true
+                DISCONNECTED_SECONDS=0
+            fi
+        fi
+    fi
+
+    # 每十秒进行一次稳定性检查。
+    sleep 10
+done

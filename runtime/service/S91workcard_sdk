@@ -1,0 +1,139 @@
+#!/bin/sh
+
+# 定义 SDK 正式安装根目录。
+SDK_ROOT="/opt/workcard-sdk"
+
+# 定义负责记录退出状态和自动拉起服务的 supervisor。
+SUPERVISOR_BIN="$SDK_ROOT/bin/workcard-sdk-supervisor"
+
+# 定义 supervisor 进程号文件。
+SUPERVISOR_PID_FILE="/run/workcard-sdk-supervisor.pid"
+
+# 定义真实服务子进程号文件。
+SERVICE_PID_FILE="/run/workcard-sdk-service.pid"
+
+# 定义媒体 HAL 异常后必须冷启动恢复的保护标志。
+REBOOT_REQUIRED_FILE="/run/workcard-sdk/reboot.required"
+
+# 判断指定进程号文件对应的进程是否仍在运行。
+pid_file_is_running()
+{
+    # 进程号文件不可读时返回未运行。
+    [ -r "$1" ] || return 1
+
+    # 读取进程号并校验对应进程存在。
+    CHECK_PID="$(cat "$1" 2>/dev/null)"
+    [ -n "$CHECK_PID" ] && kill -0 "$CHECK_PID" 2>/dev/null
+}
+
+# 启动受监督的底层硬件服务。
+start_service()
+{
+    # supervisor 已经运行时保持幂等成功。
+    if pid_file_is_running "$SUPERVISOR_PID_FILE"; then
+        return 0
+    fi
+
+    # 媒体服务异常退出后拒绝原地重启，避免重复初始化残留 HAL 状态。
+    if [ -e "$REBOOT_REQUIRED_FILE" ]; then
+        echo "ERROR: media HAL state is unsafe; cold reboot is required" >&2
+        return 70
+    fi
+
+    # supervisor 缺失时返回明确安装错误。
+    if [ ! -x "$SUPERVISOR_BIN" ]; then
+        echo "ERROR: workcard-sdk-supervisor is not installed" >&2
+        return 1
+    fi
+
+    # 创建运行目录并清理失效进程号。
+    mkdir -p /run/workcard-sdk
+    rm -f "$SUPERVISOR_PID_FILE" "$SERVICE_PID_FILE"
+
+    # 完全脱离当前终端启动 supervisor 并记录准确进程号。
+    nohup "$SUPERVISOR_BIN" >/dev/null 2>&1 </dev/null &
+    echo "$!" >"$SUPERVISOR_PID_FILE"
+
+    # 最多等待五秒确认真实服务子进程已经启动。
+    WAITED_SECONDS="0"
+    while ! pid_file_is_running "$SERVICE_PID_FILE" && [ "$WAITED_SECONDS" -lt 5 ]; do
+        sleep 1
+        WAITED_SECONDS=$((WAITED_SECONDS + 1))
+    done
+
+    # 真实服务未启动时返回明确失败。
+    pid_file_is_running "$SERVICE_PID_FILE"
+}
+
+# 正常停止 supervisor 和真实服务。
+stop_service()
+{
+    # supervisor 存在时只向 supervisor 发送终止信号，由其转发给服务。
+    if pid_file_is_running "$SUPERVISOR_PID_FILE"; then
+        SUPERVISOR_PID="$CHECK_PID"
+        kill -TERM "$SUPERVISOR_PID" 2>/dev/null || true
+    fi
+
+    # 最多等待十五秒供媒体资源按顺序释放。
+    WAITED_SECONDS="0"
+    while pid_file_is_running "$SUPERVISOR_PID_FILE" && [ "$WAITED_SECONDS" -lt 15 ]; do
+        sleep 1
+        WAITED_SECONDS=$((WAITED_SECONDS + 1))
+    done
+
+    # supervisor 未按时退出时拒绝静默遗留失控服务。
+    if pid_file_is_running "$SUPERVISOR_PID_FILE"; then
+        echo "ERROR: workcard-sdk-supervisor stop timeout" >&2
+        return 1
+    fi
+
+    # 清理已经失效的运行文件。
+    rm -f "$SUPERVISOR_PID_FILE" "$SERVICE_PID_FILE"
+}
+
+# 输出 supervisor 和真实服务的双层状态。
+show_status()
+{
+    # supervisor 必须处于运行状态。
+    if pid_file_is_running "$SUPERVISOR_PID_FILE"; then
+        echo "workcard-sdk-supervisor: running"
+    else
+        echo "workcard-sdk-supervisor: stopped"
+        return 1
+    fi
+
+    # 真实服务子进程也必须处于运行状态。
+    if pid_file_is_running "$SERVICE_PID_FILE"; then
+        echo "workcard-sdk-service: running"
+    else
+        echo "workcard-sdk-service: restarting"
+        return 1
+    fi
+}
+
+# 默认执行启动操作。
+ACTION="$1"
+if [ -z "$ACTION" ]; then
+    ACTION="start"
+fi
+
+# 根据 SysV 参数执行对应服务管理操作。
+case "$ACTION" in
+    start)
+        start_service
+        ;;
+    stop)
+        stop_service
+        ;;
+    restart)
+        stop_service
+        start_service
+        ;;
+    status)
+        show_status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

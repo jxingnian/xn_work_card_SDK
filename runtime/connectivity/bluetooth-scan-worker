@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# 任意扫描步骤失败时返回非零状态。
+set -eu
+
+# 读取固定范围内的扫描时长和输出文件。
+DURATION_SECONDS="$1"
+OUTPUT_FILE="$2"
+
+# 使用同目录临时文件避免 MQTT Agent 读取半截结果。
+TEMP_FILE="${OUTPUT_FILE}.tmp"
+
+# 在五秒命令超时内打开蓝牙控制器，避免 D-Bus 异常时工作器长期占用。
+bluetoothctl --timeout 5 power on >/dev/null 2>&1
+
+# 执行使用调用方扫描时长的受限扫描。
+bluetoothctl --timeout "$DURATION_SECONDS" scan on >"$TEMP_FILE" 2>&1 || true
+
+# 追加 BlueZ 当前已知设备，保证扫描输出没有 NEW 行时仍能得到名称。
+bluetoothctl --timeout 5 devices >>"$TEMP_FILE" 2>&1 || true
+
+# 原子发布完整扫描原始结果。
+mv "$TEMP_FILE" "$OUTPUT_FILE"

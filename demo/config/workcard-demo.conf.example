@@ -1,0 +1,58 @@
+# 当前生产 WSS 媒体服务地址。
+server_url=wss://iot.xingnian.vip/device-stream
+
+# 服务器证书校验使用的 CA 文件。
+ca_file=/opt/workcard-demo/ca-certificates.crt
+
+# 客户在后台创建设备后填写独立设备编号。
+device_id=
+
+# 客户填写后台仅展示一次的设备密钥，禁止写入源码和日志。
+device_secret=
+
+# MQTT TLS Broker 主机名和端口。
+mqtt_host=iot.xingnian.vip
+mqtt_port=8883
+
+# 客户填写后台分配的设备独立 MQTT 账号，禁止与其他设备共用。
+mqtt_username=
+mqtt_password=
+
+# Demo 上报的客户应用固件版本。
+firmware_version=V1.0.0-workcard-demo
+
+# 保存后台动态摄像头配置 revision 和最后一次生效参数。
+managed_state_file=/opt/workcard-demo/camera-state.conf
+
+# H.264 输出宽度。
+video_width=640
+
+# H.264 输出高度。
+video_height=320
+
+# H.264 输出帧率。
+video_fps=5
+
+# H.264 关键帧间隔。
+video_gop=10
+
+# H.264 目标码率。
+video_bitrate_bps=512000
+
+# 当前固件固定使用 16 kHz Opus。
+audio_sample_rate=16000
+
+# 当前固件固定使用单声道音频。
+audio_channels=1
+
+# WiFi 配置期间用于保持云端连接的有线接口。
+wired_interface=eth0
+
+# Air780EGP 通过网线提供的默认网关。
+wired_gateway=192.168.10.1
+
+# 切换备用网络和等待 WiFi 重新关联的最大秒数。
+network_switch_timeout_seconds=30
+
+# 保存 Demo 已同步的 WiFi 配置元数据，不包含密码或派生 PSK。
+wifi_state_file=/opt/workcard-demo/wifi-state.conf
